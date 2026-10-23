@@ -1,0 +1,506 @@
+name: Build release
+run-name: Release ${{ inputs.version || 'package version' }} (publish=${{ inputs.publish }})
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override; empty uses native/desktop/package.json'
+        type: string
+        default: ''
+      source_ref:
+        description: 'Private source branch, tag or commit'
+        type: string
+        default: main
+      publish:
+        description: 'Publish the release (false keeps it a draft)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize releases, including an empty version versus an explicit version of
+# the same package. A version-only key cannot detect that collision in advance.
+concurrency:
+  group: pureblood-and-prejudice-release
+  cancel-in-progress: false
+
+# Never include build logs, source checkouts, npm caches or debug data in release artifacts.
+# Tool output goes to $RUNNER_TEMP logs; a failing step prints their last 80 lines.
+env:
+  CI: 'true'
+  PYTHONUTF8: '1'
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+  REQUESTED_VERSION: ${{ inputs.version }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs: &build-outputs
+      version: ${{ steps.metadata.outputs.version }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+    steps:
+      - &checkout-source
+        name: Check out private source
+        uses: actions/checkout@v6
+        with:
+          repository: CocolemonTV/pureblood-and-prejudice
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+          lfs: false
+          persist-credentials: false
+          show-progress: false
+      - &python
+        name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - &metadata
+        name: Resolve version and source identity
+        id: metadata
+        run: |
+          python - <<'PYTHON'
+          import json, os, re, subprocess
+          from pathlib import Path
+          try:
+              package = Path('native/desktop/package.json')
+              version = os.environ['REQUESTED_VERSION'] or json.loads(package.read_text())['version']
+              number = r'(?:0|[1-9][0-9]*)'
+              identifier = r'[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*'
+              pattern = rf'{number}\.{number}\.{number}(?:-({identifier}))?(?:\+{identifier})?'
+              match = re.fullmatch(pattern, version)
+              if not match or (match[1] and any(p.isdigit() and len(p) > 1 and p[0] == '0' for p in match[1].split('.'))):
+                  raise ValueError()
+              # An override changes packaging metadata only in this disposable checkout.
+              if os.environ.get('NATIVE_BUILD') == 'true':
+                  for folder in ('native', 'native/desktop', 'native/mobile'):
+                      for name in ('package.json', 'package-lock.json'):
+                          path = Path(folder) / name
+                          if not path.is_file():
+                              if name == 'package-lock.json' and folder == 'native':
+                                  continue  # native/ only delegates; it has no dependencies/lock.
+                              raise ValueError()
+                          data = json.loads(path.read_text())
+                          data['version'] = version
+                          if name == 'package-lock.json':
+                              data['packages']['']['version'] = version
+                          path.write_text(json.dumps(data, indent=2) + '\n')
+                  gradle = Path('native/mobile/android/app/build.gradle')
+                  text, count = re.subn(r'versionName = "[^"\n]+"', f'versionName = "{version}"', gradle.read_text())
+                  if count != 1:
+                      raise ValueError()
+                  gradle.write_text(text)
+              sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write(f'version={version}\nsource_sha={sha}\n')
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write(f'RELEASE_VERSION={version}\n')
+          except Exception:
+              raise SystemExit('Version/source validation failed; use a valid SemVer and complete source snapshot.') from None
+          PYTHON
+      - name: Set up Node (audio manifest verification only)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.21.1'
+          package-manager-cache: false
+      - name: Install web tools
+        run: |
+          if ! { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends webp zip; } \
+              > "$RUNNER_TEMP/web-tools.log" 2>&1; then
+            echo 'Web tool installation failed.'; exit 1
+          fi
+          # --verify only hashes existing audio; ffmpeg is not needed.
+      - name: Build itch.io ZIP
+        run: |
+          ./build.sh > "$RUNNER_TEMP/web-build.log" 2>&1 ||
+            { echo 'Web build failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+          python - <<'PYTHON'
+          from pathlib import Path
+          from zipfile import ZipFile
+          path = Path('dist/pureblood-and-prejudice.zip')
+          with ZipFile(path) as archive:
+              count = len(archive.infolist())
+              if count >= 1000:
+                  raise SystemExit('itch.io ZIP must contain fewer than 1000 entries.')
+          print(f'{path.name}: {path.stat().st_size} bytes, {count} entries')
+          PYTHON
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-web
+          path: source/dist/pureblood-and-prejudice.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs: *build-outputs
+    env:
+      NATIVE_BUILD: 'true'
+    steps:
+      - *checkout-source
+      - *python
+      - *metadata
+      - name: Set up Node and npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.21.1'
+          cache: npm
+          cache-dependency-path: source/native/desktop/package-lock.json
+      - name: Install Linux tools and dependencies
+        run: |
+          if ! { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends webp; } \
+              > "$RUNNER_TEMP/linux-tools.log" 2>&1; then
+            echo 'Linux tool installation failed.'; exit 1
+          fi
+          npm ci --prefix native/desktop > "$RUNNER_TEMP/linux-npm.log" 2>&1 ||
+            { echo 'Desktop dependency installation failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - &stage
+        name: Stage and verify native payload
+        run: |
+          npm --prefix native run stage > "$RUNNER_TEMP/native-stage.log" 2>&1 ||
+            { echo 'Native staging failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+          # Desktop jobs do not need Capacitor's npm dependencies.
+          python native/scripts/stage.py --check > "$RUNNER_TEMP/native-check.log" 2>&1 ||
+            { echo 'Native stage verification failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - name: Build Linux x64 and ARM64
+        run: |
+          node native/desktop/build.cjs linux --x64 --arm64 > "$RUNNER_TEMP/linux-build.log" 2>&1 ||
+            { echo 'Linux packaging failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+          for suffix in linux-x86_64.AppImage linux-x64.tar.gz linux-arm64.AppImage linux-arm64.tar.gz; do
+            test -s "dist/native/desktop/Pureblood-and-Prejudice-$RELEASE_VERSION-$suffix" ||
+              { echo 'An expected Linux artifact is missing.'; exit 1; }
+          done
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            source/dist/native/desktop/*.AppImage
+            source/dist/native/desktop/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs: *build-outputs
+    env:
+      NATIVE_BUILD: 'true'
+    steps:
+      - *checkout-source
+      - *python
+      - *metadata
+      - name: Set up Node and npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.21.1'
+          cache: npm
+          cache-dependency-path: source/native/desktop/package-lock.json
+      - name: Install checksum-pinned Windows WebP
+        run: |
+          python - <<'PYTHON'
+          import hashlib, io, os
+          from pathlib import Path
+          from urllib.request import urlopen
+          from zipfile import ZipFile
+          try:
+              url = 'https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-windows-x64.zip'
+              with urlopen(url, timeout=60) as response:
+                  data = response.read()
+              expected = '48886f506b21f62e4661f0f4cbfca19800897c385128e8902542d29a950c93f1'
+              if hashlib.sha256(data).hexdigest() != expected:
+                  raise ValueError()
+              destination = Path(os.environ['RUNNER_TEMP']) / 'pp-webp'
+              with ZipFile(io.BytesIO(data)) as archive:
+                  archive.extractall(destination)
+              encoder = destination / 'libwebp-1.6.0-windows-x64/bin/cwebp.exe'
+              if not encoder.is_file():
+                  raise ValueError()
+              with open(os.environ['GITHUB_PATH'], 'a') as output:
+                  output.write(str(encoder.parent) + '\n')
+          except Exception:
+              raise SystemExit('Windows WebP download/verification failed.') from None
+          PYTHON
+      - name: Install desktop dependencies
+        run: |
+          npm ci --prefix native/desktop > "$RUNNER_TEMP/windows-npm.log" 2>&1 ||
+            { echo 'Desktop dependency installation failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - *stage
+      - name: Build and verify Windows x64
+        run: |
+          npm --prefix native run build:windows > "$RUNNER_TEMP/windows-build.log" 2>&1 ||
+            { echo 'Windows packaging failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+          for ext in exe zip; do
+            test -s "dist/native/desktop/Pureblood-and-Prejudice-$RELEASE_VERSION-win-x64.$ext" ||
+              { echo 'An expected Windows artifact is missing.'; exit 1; }
+          done
+          python native/scripts/verify_artifact.py --kind windows             "dist/native/desktop/Pureblood-and-Prejudice-$RELEASE_VERSION-win-x64.zip"             > "$RUNNER_TEMP/windows-verify.log" 2>&1 ||
+            { echo 'Windows packaged payload verification failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            source/dist/native/desktop/*.exe
+            source/dist/native/desktop/*-win-x64.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    outputs: *build-outputs
+    env:
+      NATIVE_BUILD: 'true'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - *checkout-source
+      - *python
+      - *metadata
+      - name: Set up Node and npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.21.1'
+          cache: npm
+          cache-dependency-path: source/native/desktop/package-lock.json
+      - name: Install macOS tools and dependencies
+        run: |
+          test "$(uname -m)" = arm64 || { echo 'Apple Silicon runner required.'; exit 1; }
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install webp > "$RUNNER_TEMP/mac-tools.log" 2>&1 ||
+            { echo 'WebP installation failed.'; exit 1; }
+          npm ci --prefix native/desktop > "$RUNNER_TEMP/mac-npm.log" 2>&1 ||
+            { echo 'Desktop dependency installation failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - *stage
+      - name: Build unsigned macOS ARM64 and x64
+        run: |
+          npm --prefix native run build:mac > "$RUNNER_TEMP/mac-build.log" 2>&1 ||
+            { echo 'macOS packaging failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+          for arch in arm64 x64; do
+            for ext in dmg zip; do
+              test -s "dist/native/desktop/Pureblood-and-Prejudice-$RELEASE_VERSION-mac-$arch.$ext" ||
+                { echo 'An expected macOS artifact is missing.'; exit 1; }
+            done
+          done
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mac
+          path: |
+            source/dist/native/desktop/*.dmg
+            source/dist/native/desktop/*-mac-*.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs: *build-outputs
+    env:
+      NATIVE_BUILD: 'true'
+    steps:
+      - *checkout-source
+      - *python
+      - *metadata
+      - name: Set up Node and npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.21.1'
+          cache: npm
+          cache-dependency-path: source/native/mobile/package-lock.json
+      - name: Set up Temurin JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK packages, WebP and dependencies
+        run: |
+          if ! { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends webp; } \
+              > "$RUNNER_TEMP/android-tools.log" 2>&1; then
+            echo 'WebP installation failed.'; exit 1
+          fi
+          # Standard Ubuntu runners include Android command-line tools and licences.
+          # Explicitly install the exact packages required by common.mjs/Gradle.
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'platforms;android-36' 'build-tools;35.0.0'             > "$RUNNER_TEMP/android-sdk.log" 2>&1 ||
+            { echo 'Android SDK package installation failed.'; exit 1; }
+          npm ci --prefix native/mobile > "$RUNNER_TEMP/android-npm.log" 2>&1 ||
+            { echo 'Mobile dependency installation failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - *stage
+      - name: Check mobile configuration
+        run: |
+          npm --prefix native run check > "$RUNNER_TEMP/mobile-check.log" 2>&1 ||
+            { echo 'Mobile configuration check failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - name: Decode temporary signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          python - <<'PYTHON'
+          import base64, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'pp-android-release.jks'
+          try:
+              encoded = ''.join(os.environ['ANDROID_KEYSTORE_BASE64'].split())
+              if not encoded:
+                  raise ValueError()
+              data = base64.b64decode(encoded, validate=True)
+              if not data:
+                  raise ValueError()
+              with path.open('xb') as key:
+                  os.chmod(path, 0o600)
+                  key.write(data)
+          except Exception:
+              raise SystemExit('Android signing key is missing or invalid.') from None
+          PYTHON
+      - name: Build signed Android release
+        env:
+          PP_ANDROID_KEYSTORE: ${{ runner.temp }}/pp-android-release.jks
+          PP_ANDROID_KEY_ALIAS: cocolemon
+          PP_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$PP_ANDROID_KEYSTORE_PASSWORD" || { echo 'Android signing password is missing.'; exit 1; }
+          npm --prefix native run build:apk:signed > "$RUNNER_TEMP/android-build.log" 2>&1 ||
+            { echo 'Signed Android build failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - name: Verify Android signature and packaged payload
+        run: |
+          apk="dist/native/android/Pureblood-and-Prejudice-$RELEASE_VERSION.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk"             > "$RUNNER_TEMP/apksigner.log" 2>&1 ||
+            { echo 'Android signature verification failed.'; exit 1; }
+          # Only these two certificate fields may reach public logs.
+          grep -E '^Signer #1 certificate (DN:|SHA-256 digest:)' "$RUNNER_TEMP/apksigner.log"
+          python native/scripts/verify_artifact.py --kind android "$apk"             > "$RUNNER_TEMP/android-verify.log" 2>&1 ||
+            { echo 'Android packaged payload verification failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
+      - name: Upload signed Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: source/dist/native/android/Pureblood-and-Prejudice-*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+      - name: Delete temporary signing key
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: rm -f -- "$RUNNER_TEMP/pp-android-release.jks"
+
+  # iOS intentionally skipped: current unsigned archives/simulator builds are
+  # not installable player downloads. Add iOS only with a signed distribution plan.
+
+  release:
+    needs: [web, linux, windows, mac, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - *checkout-source
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Validate, checksum and create or update release
+        uses: actions/github-script@v8
+        env:
+          BUILDS: ${{ toJSON(needs) }}
+          PUBLISH: ${{ inputs.publish }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Avoid automatically retrying mutations.
+          retries: 0
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const crypto = require('node:crypto');
+            const { execFileSync } = require('node:child_process');
+            const builds = Object.values(JSON.parse(process.env.BUILDS));
+            const version = builds[0].outputs.version;
+            const sourceSha = builds[0].outputs.source_sha;
+            if (!version || !sourceSha || builds.some(b => b.result !== 'success' ||
+                b.outputs.version !== version || b.outputs.source_sha !== sourceSha)) {
+              throw new Error('Builds disagree on source/version; rerun with an immutable source_ref.');
+            }
+            const checkedOutSha = execFileSync('git', ['-C', 'source', 'rev-parse', 'HEAD'], {encoding: 'utf8'}).trim();
+            if (checkedOutSha !== sourceSha) throw new Error('Source ref moved; rerun with an immutable source_ref.');
+            const prefix = `Pureblood-and-Prejudice-${version}`;
+            const files = [
+              'pureblood-and-prejudice.zip',
+              `${prefix}-linux-x86_64.AppImage`, `${prefix}-linux-x64.tar.gz`,
+              `${prefix}-linux-arm64.AppImage`, `${prefix}-linux-arm64.tar.gz`,
+              `${prefix}-win-x64.exe`, `${prefix}-win-x64.zip`,
+              `${prefix}-mac-arm64.dmg`, `${prefix}-mac-arm64.zip`,
+              `${prefix}-mac-x64.dmg`, `${prefix}-mac-x64.zip`, `${prefix}.apk`
+            ].sort();
+            const directory = 'artifacts';
+            const actual = fs.readdirSync(directory).sort();
+            if (JSON.stringify(actual) !== JSON.stringify(files) ||
+                files.some(name => !fs.statSync(path.join(directory, name)).isFile() ||
+                  fs.statSync(path.join(directory, name)).size === 0)) {
+              throw new Error('Expected exactly twelve nonempty release artifacts.');
+            }
+            let sums = '';
+            for (const name of files) {
+              const hash = crypto.createHash('sha256');
+              for await (const chunk of fs.createReadStream(path.join(directory, name))) hash.update(chunk);
+              sums += `${hash.digest('hex')}  ${name}\n`;
+              core.info(`${name}: ${fs.statSync(path.join(directory, name)).size} bytes`);
+            }
+            fs.writeFileSync(path.join(directory, 'SHA256SUMS.txt'), sums);
+            const notes = `Pureblood & Prejudice ${version}\n\n` +
+              'Web, Windows x64, Linux x64/ARM64, unsigned macOS Intel/Apple Silicon, and signed Android.\n' +
+              'SHA256SUMS.txt contains SHA-256 checksums for every download.\n\n' +
+              [...files, 'SHA256SUMS.txt'].map(name => `- ${name}`).join('\n');
+            // context.repo is THIS public repository. Never tag the private checkout.
+            const repository = context.repo;
+            const tag = `v${version}`;
+            try {
+              const releases = await github.paginate(github.rest.repos.listReleases, {...repository, per_page: 100});
+              let release = releases.find(item => item.tag_name === tag);
+              const metadata = {...repository, name: `Pureblood & Prejudice ${version}`, body: notes, draft: true};
+              if (release) {
+                // Return an existing release to draft while assets are being replaced.
+                release = (await github.rest.repos.updateRelease({...metadata, release_id: release.id})).data;
+              } else {
+                release = (await github.rest.repos.createRelease({
+                  ...metadata, tag_name: tag, target_commitish: context.sha
+                })).data;
+              }
+              // Remove previous/stale assets too; reruns produce exactly this file set.
+              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+                ...repository, release_id: release.id, per_page: 100
+              });
+              for (const asset of assets) await github.rest.repos.deleteReleaseAsset({...repository, asset_id: asset.id});
+              for (const name of [...files, 'SHA256SUMS.txt']) {
+                const file = path.join(directory, name);
+                await github.rest.repos.uploadReleaseAsset({
+                  ...repository, release_id: release.id, name,
+                  data: fs.readFileSync(file), headers: {'content-type': 'application/octet-stream'}
+                });
+              }
+              // Publication is the final operation, after every upload succeeds.
+              await github.rest.repos.updateRelease({
+                ...repository, release_id: release.id, draft: process.env.PUBLISH !== 'true'
+              });
+              core.info(`Release ${tag} updated (${process.env.PUBLISH === 'true' ? 'published' : 'draft'}).`);
+            } catch (error) {
+              core.setFailed(`Release update failed: ${error.message}`);
+            }
