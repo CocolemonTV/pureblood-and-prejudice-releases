@@ -504,3 +504,44 @@ jobs:
             } catch (error) {
               core.setFailed(`Release update failed: ${error.message}`);
             }
+
+  # Point the Homebrew cask at the new Mac downloads once the release is public.
+  homebrew:
+    needs: [mac, release]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tap
+    steps:
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: CocolemonTV/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-mac
+          path: mac
+      - name: Update cask version and checksums
+        env:
+          VERSION: ${{ needs.mac.outputs.version }}
+        run: |
+          arm=$(sha256sum "../mac/Pureblood-and-Prejudice-$VERSION-mac-arm64.dmg" | cut -d' ' -f1)
+          intel=$(sha256sum "../mac/Pureblood-and-Prejudice-$VERSION-mac-x64.dmg" | cut -d' ' -f1)
+          cask=Casks/pureblood-and-prejudice.rb
+          sed -i -E \
+            -e "s/^  version \"[^\"]+\"/  version \"$VERSION\"/" \
+            -e "s/^  sha256 arm:   \"[0-9a-f]+\"/  sha256 arm:   \"$arm\"/" \
+            -e "s/^         intel: \"[0-9a-f]+\"/         intel: \"$intel\"/" "$cask"
+          if ! { grep -q "version \"$VERSION\"" "$cask" && grep -q "$arm" "$cask" && grep -q "$intel" "$cask"; }; then
+            echo 'Cask update did not apply.'; exit 1
+          fi
+          if git diff --quiet; then echo 'Cask already current.'; exit 0; fi
+          git config user.name CocolemonTV
+          git config user.email 345821604+CocolemonTV@users.noreply.github.com
+          git commit -am "pureblood-and-prejudice $VERSION"
+          git push
