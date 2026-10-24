@@ -545,3 +545,31 @@ jobs:
           git config user.email 345821604+CocolemonTV@users.noreply.github.com
           git commit -am "pureblood-and-prejudice $VERSION"
           git push
+
+  # Push the web build to itch.io's html5 channel once the release is public.
+  itch:
+    needs: [web, release]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Download web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-web
+          path: web
+      - name: Install butler
+        run: |
+          curl -fsSL -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip -q butler.zip -d butler && chmod +x butler/butler
+          ./butler/butler -V
+      - name: Push to itch.io
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          VERSION: ${{ needs.web.outputs.version }}
+        run: |
+          test -n "$BUTLER_API_KEY" || { echo 'BUTLER_API_KEY secret is missing.'; exit 1; }
+          ./butler/butler push web/pureblood-and-prejudice.zip ruizukun-dev/malfoid-dating-sim:html5 --userversion "$VERSION"
