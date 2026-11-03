@@ -264,7 +264,9 @@ jobs:
           overwrite: true
 
   mac:
-    runs-on: macos-latest
+    # Intel runner: GitHub's macOS arm64 pool was out of capacity (2026-11-03).
+    # electron-builder still produces both arm64 and x64 apps from here.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     outputs: *build-outputs
     env:
@@ -282,7 +284,6 @@ jobs:
           cache-dependency-path: source/native/desktop/package-lock.json
       - name: Install macOS tools and dependencies
         run: |
-          test "$(uname -m)" = arm64 || { echo 'Apple Silicon runner required.'; exit 1; }
           HOMEBREW_NO_AUTO_UPDATE=1 brew install webp > "$RUNNER_TEMP/mac-tools.log" 2>&1 ||
             { echo 'WebP installation failed.'; exit 1; }
           npm ci --prefix native/desktop > "$RUNNER_TEMP/mac-npm.log" 2>&1 ||
