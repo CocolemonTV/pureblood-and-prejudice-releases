@@ -128,9 +128,12 @@ jobs:
           from zipfile import ZipFile
           path = Path('dist/pureblood-and-prejudice.zip')
           with ZipFile(path) as archive:
-              count = len(archive.infolist())
-              if count >= 1000:
-                  raise SystemExit('itch.io ZIP must contain fewer than 1000 entries.')
+              names = archive.namelist()
+              # itch.io counts folders too (v0.3.3 was rejected at 986 files + 48 folders).
+              folders = {'/'.join(n.rstrip('/').split('/')[:i]) for n in names for i in range(1, len(n.rstrip('/').split('/')))}
+              count = len(set(names) | folders)
+              if count > 950:
+                  raise SystemExit(f'itch.io ZIP too close to the 1,000-entry limit (files + folders): {count}')
           print(f'{path.name}: {path.stat().st_size} bytes, {count} entries')
           PYTHON
       - name: Upload web artifact
