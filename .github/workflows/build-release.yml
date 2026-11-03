@@ -123,19 +123,8 @@ jobs:
         run: |
           ./build.sh > "$RUNNER_TEMP/web-build.log" 2>&1 ||
             { echo 'Web build failed; last lines follow.'; tail -n 80 "$RUNNER_TEMP"/*.log; exit 1; }
-          python - <<'PYTHON'
-          from pathlib import Path
-          from zipfile import ZipFile
-          path = Path('dist/pureblood-and-prejudice.zip')
-          with ZipFile(path) as archive:
-              names = archive.namelist()
-              # itch.io counts folders too (v0.3.3 was rejected at 986 files + 48 folders).
-              folders = {'/'.join(n.rstrip('/').split('/')[:i]) for n in names for i in range(1, len(n.rstrip('/').split('/')))}
-              count = len(set(names) | folders)
-              if count > 950:
-                  raise SystemExit(f'itch.io ZIP too close to the 1,000-entry limit (files + folders): {count}')
-          print(f'{path.name}: {path.stat().st_size} bytes, {count} entries')
-          PYTHON
+          # itch.io counts files + folders (limit 1,000); fails the build if over.
+          python3 tools/itch/check_zip.py dist/pureblood-and-prejudice.zip
       - name: Upload web artifact
         uses: actions/upload-artifact@v4
         with:
@@ -576,4 +565,20 @@ jobs:
           VERSION: ${{ needs.web.outputs.version }}
         run: |
           test -n "$BUTLER_API_KEY" || { echo 'BUTLER_API_KEY secret is missing.'; exit 1; }
+          # Last guard before upload: itch rejects zips over 1,000 files + folders.
+          python3 - web/pureblood-and-prejudice.zip <<'PYTHON'
+          import sys
+          from zipfile import ZipFile
+          names = ZipFile(sys.argv[1]).namelist()
+          files = {n for n in names if not n.endswith('/')}
+          folders = {n.rstrip('/') for n in names if n.endswith('/')}
+          folders |= {'/'.join(f.split('/')[:i]) for f in files for i in range(1, len(f.split('/')))}
+          total = len(files) + len(folders)
+          print(f'{len(files)} files + {len(folders)} folders = {total} entries (itch limit 1000)')
+          if total > 1000:
+              print(f'::error::itch.io would reject this zip: {total} > 1000 entries. Upload cancelled.')
+              sys.exit(1)
+          if total > 950:
+              print(f'::warning::Only {1000 - total} entries below the itch.io limit.')
+          PYTHON
           ./butler/butler push web/pureblood-and-prejudice.zip ruizukun-dev/malfoid-dating-sim:html5 --userversion "$VERSION"
